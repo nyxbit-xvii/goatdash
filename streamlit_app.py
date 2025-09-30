@@ -29,54 +29,72 @@ def parse_csv(file) -> pd.DataFrame:
 
 def parse_gpx(file) -> pd.DataFrame:
     """
-    Parse GPX file (like those exported from Tractive) into a DataFrame
-    with columns: timestamp, lat, lon.
+    Robust GPX parser (works with Tractive exports).
+    Returns a DataFrame with columns: timestamp, lat, lon (and optional speed if present in <cmt>).
     """
+    import re
     from xml.etree import ElementTree as ET
 
-    # Read text
-    text = file.read()
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", errors="ignore")
+    # Read bytes from Streamlit's UploadedFile, then decode
+    data = file.getvalue() if hasattr(file, "getvalue") else file.read()
+    if isinstance(data, bytes):
+        text = data.decode("utf-8", errors="ignore")
+    else:
+        text = str(data)
 
-    # Parse XML
     try:
         root = ET.fromstring(text)
     except Exception as e:
         raise ValueError(f"GPX parse error: {e}")
 
-    # Common GPX namespace
-    ns = {"g": "http://www.topografix.com/GPX/1/1"}
+    # Detect default namespace from root.tag, e.g., "{http://www.topografix.com/GPX/1/1}gpx"
+    m = re.match(r"\{(.*)\}", root.tag)
+    ns = m.group(1) if m else "http://www.topografix.com/GPX/1/1"
 
-    # Look for <trkpt> (track points) or <wpt> (waypoints)
-    pts = root.findall(".//g:trkpt", ns) or root.findall(".//trkpt")
+    sel_trkpt = f".//{{{ns}}}trkpt"
+    sel_wpt   = f".//{{{ns}}}wpt"
+    sel_time  = f".//{{{ns}}}time"
+    sel_ele   = f".//{{{ns}}}ele"
+    sel_cmt   = f".//{{{ns}}}cmt"
+
+    # Prefer track points; fall back to waypoints if needed
+    pts = root.findall(sel_trkpt)
     if not pts:
-        pts = root.findall(".//g:wpt", ns) or root.findall(".//wpt")
+        pts = root.findall(sel_wpt)
 
     rows = []
     for p in pts:
         lat = p.attrib.get("lat")
         lon = p.attrib.get("lon")
+        t_el = p.find(sel_time) or p.find("time")      # fallback if no namespace
+        c_el = p.find(sel_cmt)  or p.find("cmt")
 
-        # Try to find a <time> element inside the point
-        time_el = p.find("g:time", ns) or p.find("time")
-        t = time_el.text if time_el is not None else None
+        t = t_el.text if t_el is not None else None
+        c = c_el.text if c_el is not None else None
 
-        if lat and lon:
-            rows.append({
-                "timestamp": pd.to_datetime(t, utc=True, errors="coerce") if t else pd.NaT,
-                "lat": pd.to_numeric(lat, errors="coerce"),
-                "lon": pd.to_numeric(lon, errors="coerce")
-            })
+        rows.append({"timestamp": t, "lat": lat, "lon": lon, "cmt": c})
 
-    df = pd.DataFrame(rows).dropna(subset=["lat", "lon"])
-    if "timestamp" in df:
-        df = df.dropna(subset=["timestamp"])
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("No points found in GPX file.")
+
+    # Convert types
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+
+    # Optional speed extraction if Tractive stored "speed: X" in <cmt>
+    if "cmt" in df.columns:
+        sp = df["cmt"].str.extract(r"speed:\s*([\d\.]+)")
+        with pd.option_context("mode.chained_assignment", None):
+            df["speed"] = pd.to_numeric(sp[0], errors="coerce")
+
+    # Keep only valid rows
+    df = df.dropna(subset=["timestamp", "lat", "lon"]).sort_values("timestamp").reset_index(drop=True)
     if df.empty:
         raise ValueError("No valid points with time/lat/lon found in GPX file.")
 
-    return df.sort_values("timestamp").reset_index(drop=True)
-
+    return df
 
 def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
     url = "https://api.open-meteo.com/v1/forecast"
