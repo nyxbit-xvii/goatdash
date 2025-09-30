@@ -7,61 +7,52 @@ import streamlit as st
 import pydeck as pdk
 import altair as alt
 from xml.etree import ElementTree as ET
+from io import BytesIO
+from PIL import Image, ImageDraw
 
 # ----------------- CONFIG -----------------
 GPX_FILE = "assets/Bonus_Latest.gpx"
 DASHBOARD_TITLE = "HerdTracker at Steep Mountain Farm — Bonus’s Weekly Recap"
 ICON_URL = "https://raw.githubusercontent.com/nyxbit-xvii/goatdash/refs/heads/main/assets/bonus_icon.png"
+MAPBOX_STYLE = "mapbox://styles/mapbox/satellite-streets-v11"
+STATIC_IMAGE_STYLE = "satellite-streets-v11"  # for Mapbox Static Images API
+STATIC_W, STATIC_H, STATIC_ZOOM = 1024, 768, 18  # background for GIF/video
 
-# Mapbox token from Streamlit secrets
+# Mapbox token (must be in Streamlit secrets)
 pdk.settings.mapbox_api_key = st.secrets["MAPBOX_API_KEY"]
+MAPBOX_TOKEN = st.secrets["MAPBOX_API_KEY"]
 
 # ----------------- HELPERS -----------------
 def parse_gpx(path: str) -> pd.DataFrame:
-    """Parse Tractive GPX export into DataFrame with timestamp, lat, lon, optional speed."""
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
-
     ns = {"g": "http://www.topografix.com/GPX/1/1"}
     root = ET.fromstring(text)
     pts = root.findall(".//g:trkpt", ns)
-
     rows = []
     for p in pts:
         lat = p.attrib.get("lat")
         lon = p.attrib.get("lon")
-        time_el = p.find("g:time", ns)
-        cmt_el = p.find("g:cmt", ns)
-        rows.append({
-            "timestamp": time_el.text if time_el is not None else None,
-            "lat": lat,
-            "lon": lon,
-            "cmt": cmt_el.text if cmt_el is not None else None
-        })
-
+        t = (p.find("g:time", ns).text if p.find("g:time", ns) is not None else None)
+        c = (p.find("g:cmt", ns).text if p.find("g:cmt", ns) is not None else None)
+        rows.append({"timestamp": t, "lat": lat, "lon": lon, "cmt": c})
     df = pd.DataFrame(rows)
-    if df.empty:
-        raise ValueError("No <trkpt> points found in GPX.")
-
+    if df.empty: raise ValueError("No <trkpt> points found in GPX.")
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-
     if "cmt" in df.columns:
         sp = df["cmt"].str.extract(r"speed:\s*([\d\.]+)")
         df["speed"] = pd.to_numeric(sp[0], errors="coerce")
-
     df = df.dropna(subset=["timestamp", "lat", "lon"]).sort_values("timestamp").reset_index(drop=True)
     return df
 
 @st.cache_data(ttl=3600)
 def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-    """Fetch hourly weather from Open-Meteo API, cached to avoid refetching during autoplay."""
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
-            "latitude": float(lat),
-            "longitude": float(lon),
+            "latitude": float(lat), "longitude": float(lon),
             "hourly": "temperature_2m,wind_speed_10m,precipitation",
             "start_date": start.date().isoformat(),
             "end_date": end.date().isoformat(),
@@ -70,8 +61,7 @@ def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetim
         r = requests.get(url, params=params, timeout=45)
         r.raise_for_status()
         data = r.json().get("hourly", {})
-        if not data:
-            return pd.DataFrame()
+        if not data: return pd.DataFrame()
         wdf = pd.DataFrame(data)
         wdf["time"] = pd.to_datetime(wdf["time"], utc=True, errors="coerce")
         return wdf
@@ -79,12 +69,10 @@ def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetim
         return pd.DataFrame()
 
 def haversine_miles(lat1, lon1, lat2, lon2):
-    """Great-circle distance in miles."""
     from math import radians, sin, cos, asin, sqrt
-    R = 3958.8  # miles
+    R = 3958.8
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
+    dlat = lat2-lat1; dlon = lon2-lon1
     a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
     return R * 2 * asin(sqrt(a))
 
@@ -95,34 +83,98 @@ def total_distance_miles(df: pd.DataFrame) -> float:
     return float(dist)
 
 def build_interpolated_track(df: pd.DataFrame, step_minutes: int = 1):
-    """Resample timestamps to a regular grid and interpolate for smooth playback."""
     s = df.set_index("timestamp")[["lat", "lon"]].sort_index()
     start, end = s.index.min(), s.index.max()
-    new_index = pd.date_range(start, end, freq=f"{step_minutes}min", tz="UTC")
-    interp = s.reindex(new_index).interpolate(method="time").ffill().bfill()
+    idx = pd.date_range(start, end, freq=f"{step_minutes}min", tz="UTC")
+    interp = s.reindex(idx).interpolate(method="time").ffill().bfill()
     interp.index.name = "timestamp"
+    return interp.reset_index()
 
-    seconds = (interp.index - interp.index[0]).total_seconds().astype(int)
-    coords = np.column_stack([interp["lon"].values, interp["lat"].values]).tolist()
-    return interp.reset_index(), seconds, coords
+# --- Web Mercator helpers for static rendering ---
+from math import pi, log, tan, cos, atan, sinh
+TILE_SIZE = 256
 
-# ----------------- STREAMLIT UI -----------------
+def _lon_to_x(lon, z): return (lon + 180.0) / 360.0 * (2**z) * TILE_SIZE
+def _lat_to_y(lat, z):
+    lat = max(min(lat, 85.051129), -85.051129)
+    return (1 - log(tan((lat + 90)*pi/360)) / pi) / 2 * (2**z) * TILE_SIZE
+
+def latlon_to_pixel(lat, lon, center_lat, center_lon, zoom, width, height):
+    cx, cy = _lon_to_x(center_lon, zoom), _lat_to_y(center_lat, zoom)
+    x, y = _lon_to_x(lon, zoom), _lat_to_y(lat, zoom)
+    px = (x - cx) + (width/2)
+    py = (y - cy) + (height/2)
+    return int(px), int(py)
+
+@st.cache_data(ttl=3600)
+def fetch_static_map(center_lat, center_lon, w=STATIC_W, h=STATIC_H, zoom=STATIC_ZOOM) -> Image.Image:
+    # Mapbox Static Images API
+    url = (
+        f"https://api.mapbox.com/styles/v1/mapbox/{STATIC_IMAGE_STYLE}/static/"
+        f"{center_lon},{center_lat},{zoom},0/{w}x{h}?access_token={MAPBOX_TOKEN}"
+    )
+    img = Image.open(BytesIO(requests.get(url, timeout=45).content)).convert("RGBA")
+    return img
+
+@st.cache_data(ttl=3600)
+def fetch_icon() -> Image.Image:
+    resp = requests.get(ICON_URL, timeout=30)
+    im = Image.open(BytesIO(resp.content)).convert("RGBA")
+    return im
+
+def render_gif(interp: pd.DataFrame, center_lat, center_lon, outfile="bonus_week.gif",
+               zoom=STATIC_ZOOM, w=STATIC_W, h=STATIC_H, step=3):
+    """
+    Create an animated GIF with a single satellite background.
+    step = draw every Nth frame to keep file small
+    """
+    bg = fetch_static_map(center_lat, center_lon, w, h, zoom)
+    icon = fetch_icon().resize((64,64), Image.LANCZOS)
+    frames = []
+    trail_color = (0, 200, 255, 200)
+
+    # Precompute pixel coords
+    coords = [latlon_to_pixel(float(r.lat), float(r.lon), center_lat, center_lon, zoom, w, h)
+              for r in interp.itertuples(index=False)]
+
+    for i in range(0, len(interp), step):
+        base = bg.copy()
+        draw = ImageDraw.Draw(base, "RGBA")
+
+        # trail
+        if i > 1:
+            draw.line(coords[max(0, i-300):i+1], fill=trail_color, width=4)
+
+        # icon (anchor bottom-center)
+        x, y = coords[i]
+        icon_pos = (x - icon.width//2, y - icon.height)
+        base.alpha_composite(icon, icon_pos)
+
+        # timestamp label
+        ts = interp.iloc[i]["timestamp"]
+        label = ts.strftime("%Y-%m-%d %H:%M UTC")
+        # simple label bg
+        draw.rectangle([(10, h-40), (320, h-10)], fill=(0,0,0,140))
+        draw.text((16, h-34), f"Bonus — {label}", fill=(255,255,255,230))
+
+        frames.append(base)
+
+    # Save GIF
+    frames[0].save(outfile, save_all=True, append_images=frames[1:], duration=90, loop=0, disposal=2)
+    return outfile
+
+# ----------------- UI -----------------
 st.set_page_config(page_title=DASHBOARD_TITLE, layout="wide")
 st.title(DASHBOARD_TITLE)
 
-# Load weekly GPX
+# Load data
 df = parse_gpx(GPX_FILE)
-if df.empty:
-    st.error("No data in GPX file.")
-    st.stop()
-
 mid_lat, mid_lon = float(df["lat"].mean()), float(df["lon"].mean())
 
 # KPIs
 dist_miles = total_distance_miles(df)
-duration = df["timestamp"].max() - df["timestamp"].min()
-hours_span = int((duration.total_seconds() // 3600) if pd.notna(duration) else 0)
-
+span = df["timestamp"].max() - df["timestamp"].min()
+hours_span = int((span.total_seconds() // 3600) if pd.notna(span) else 0)
 c1, c2 = st.columns(2)
 c1.metric("Distance traveled", f"{dist_miles:.2f} miles")
 c2.metric("Time span", f"{hours_span} hours")
@@ -130,12 +182,14 @@ c2.metric("Time span", f"{hours_span} hours")
 # Weather (cached)
 wdf = fetch_open_meteo(mid_lat, mid_lon, df["timestamp"].min().to_pydatetime(), df["timestamp"].max().to_pydatetime())
 
-# Interpolate track to smooth frames (1-min steps)
-interp_df, frame_seconds, path_coords = build_interpolated_track(df, step_minutes=1)
-total_frames = len(interp_df)
+# Interpolated track for smooth positioning (1-min steps)
+interp = build_interpolated_track(df, step_minutes=1)
 
-# Prebuild static Heatmap
-heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+# ===============================
+# 1) Weekly HEATMAP (static)
+# ===============================
+st.subheader("1) Weekly Heatmap")
+heat_data = df.rename(columns={"lat":"latitude","lon":"longitude"})
 heat_layer = pdk.Layer(
     "HeatmapLayer",
     data=heat_data,
@@ -143,110 +197,84 @@ heat_layer = pdk.Layer(
     get_weight=1,
     radius_pixels=40,
     aggregation="MEAN",
-    color_range=[
-        [0, 255, 0, 160],
-        [255, 255, 0, 180],
-        [255, 128, 0, 200],
-        [255, 0, 0, 220],
-    ],
+    color_range=[[0,255,0,160],[255,255,0,180],[255,128,0,200],[255,0,0,220]],
 )
+heat_view = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=18, pitch=45)
+st.pydeck_chart(pdk.Deck(map_style=MAPBOX_STYLE, layers=[heat_layer], initial_view_state=heat_view))
 
-# Trips data
-trip_df = pd.DataFrame([{
-    "path": path_coords,
-    "timestamps": frame_seconds.tolist()
+st.markdown("---")
+
+# ===============================
+# 2) Inspect an hour: slider/graph drives Bonus
+# ===============================
+st.subheader("2) Inspect a Time — Bonus moves to the selected hour")
+
+# Build a single “control” slider: select any timestamp rounded to the hour
+start_ts = df["timestamp"].min().floor("H")
+end_ts = df["timestamp"].max().ceil("H")
+all_hours = pd.date_range(start_ts, end_ts, freq="H", tz="UTC")
+if len(all_hours) == 0: all_hours = pd.DatetimeIndex([start_ts])
+sel_time = st.slider("Select time (UTC)", min_value=all_hours[0].to_pydatetime(),
+                     max_value=all_hours[-1].to_pydatetime(), value=all_hours[0].to_pydatetime(),
+                     format="YYYY-MM-DD HH:mm")
+
+sel_time = pd.Timestamp(sel_time, tz="UTC")
+
+# Find nearest interpolated position for selected time
+i_idx = int(np.argmin(np.abs(interp["timestamp"].values - np.array(sel_time, dtype="datetime64[ns]"))))
+cur_lat, cur_lon = float(interp.iloc[i_idx]["lat"]), float(interp.iloc[i_idx]["lon"])
+
+# Map with ONLY the icon (no heatmap)
+icon_df = pd.DataFrame([{
+    "longitude": cur_lon, "latitude": cur_lat,
+    "icon_data": {"url": ICON_URL, "width": 256, "height": 256, "anchorY": 256}
 }])
+icon_layer = pdk.Layer(
+    "IconLayer",
+    data=icon_df,
+    get_icon="icon_data",
+    get_size=12,
+    size_scale=14,
+    get_position="[longitude, latitude]",
+)
+icon_view = pdk.ViewState(latitude=cur_lat, longitude=cur_lon, zoom=18, pitch=45)
+st.pydeck_chart(pdk.Deck(map_style=MAPBOX_STYLE, layers=[icon_layer], initial_view_state=icon_view))
 
-# Zoomed-in view
-view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=18, pitch=45)
+# Weather chart with movable vertical line (the same slider controls this)
+st.markdown("**Weather at the selected time**")
+if not wdf.empty:
+    base = alt.Chart(wdf).encode(x=alt.X("time:T", title="Time (UTC)"))
+    line_temp = base.mark_line(color="red").encode(y=alt.Y("temperature_2m:Q", title="Temp °C"))
+    line_wind = base.mark_line(color="blue").encode(y=alt.Y("wind_speed_10m:Q", title="Wind m/s"))
+    line_precip = base.mark_line(color="green").encode(y=alt.Y("precipitation:Q", title="Precip mm"))
+    rule = alt.Chart(pd.DataFrame({"time":[sel_time]})).mark_rule(color="white", strokeDash=[4,4]).encode(x="time:T")
+    chart = alt.layer(line_temp, line_wind, line_precip, rule).resolve_scale(y="independent").properties(height=260)
+    st.altair_chart(chart, use_container_width=True)
 
-# ---- Time controls ----
-st.subheader("Weekly Recap")
+st.markdown("---")
 
-speed = st.selectbox("Playback speed", ["Slow", "Normal", "Fast"], index=1)
-speed_map = {"Slow": 0.5, "Normal": 0.15, "Fast": 0.05}
+# ===============================
+# 3) One-click weekly GIF/Video
+# ===============================
+st.subheader("3) Weekly Timelapse (downloadable GIF)")
+st.caption("This renders a smooth timelapse on a satellite background and offers a file to download. No live playback needed.")
 
-frame_idx = st.slider("Frame", 0, total_frames - 1, 0, step=1)
-play = st.button("▶️ Play")
+colg1, colg2 = st.columns([1,3])
+with colg1:
+    make_gif = st.button("🎬 Generate GIF")
+with colg2:
+    st.write("Tip: after you upload a new GPX each week, press Generate GIF to refresh the weekly recap.")
 
-time_placeholder = st.empty()
-map_placeholder = st.empty()
-weather_placeholder = st.empty()
-
-def render_frame(i: int):
-    """Render map + weather + chart marker for frame i."""
-    i = int(np.clip(i, 0, total_frames - 1))
-    ts = interp_df.iloc[i]["timestamp"]
-    lat = float(interp_df.iloc[i]["lat"])
-    lon = float(interp_df.iloc[i]["lon"])
-    time_placeholder.caption(f"Time: **{ts.strftime('%Y-%m-%d %H:%M UTC')}**")
-
-    # TripsLayer
-    trips_layer = pdk.Layer(
-        "TripsLayer",
-        data=trip_df,
-        get_path="path",
-        get_timestamps="timestamps",
-        get_color=[0, 200, 255],
-        width_min_pixels=4,
-        trail_length=600,
-        current_time=int(frame_seconds[i]),
-    )
-
-    # Icon at head
-    bonus_df = pd.DataFrame([{
-        "longitude": lon,
-        "latitude": lat,
-        "icon_data": {"url": ICON_URL, "width": 256, "height": 256, "anchorY": 256}
-    }])
-    icon_layer = pdk.Layer(
-        "IconLayer",
-        data=bonus_df,
-        get_icon="icon_data",
-        get_size=10,
-        size_scale=14,
-        get_position="[longitude, latitude]",
-    )
-
-    deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/satellite-streets-v11",
-        layers=[heat_layer, trips_layer, icon_layer],
-        initial_view_state=view_state,
-        tooltip={"text": "Bonus’s weekly movement"}
-    )
-    map_placeholder.pydeck_chart(deck)
-
-    # Weather panel
-    if not wdf.empty:
-        idx = np.argmin(np.abs(wdf["time"].values - np.array(ts, dtype="datetime64[ns]")))
-        cur_wx = wdf.iloc[idx]
-        weather_placeholder.write(
-            f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
-            f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
-            f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
-            f"• Precip: **{cur_wx['precipitation']:.2f} mm**"
-        )
-
-        # Weather trends with vertical marker
-        base = alt.Chart(wdf).encode(x="time:T")
-        line_temp = base.mark_line(color="red").encode(y="temperature_2m:Q")
-        line_wind = base.mark_line(color="blue").encode(y="wind_speed_10m:Q")
-        line_precip = base.mark_line(color="green").encode(y="precipitation:Q")
-        rule = alt.Chart(pd.DataFrame({"time": [ts]})).mark_rule(color="white", strokeDash=[4,4]).encode(x="time:T")
-
-        chart = alt.layer(line_temp, line_wind, line_precip, rule).resolve_scale(y="independent").properties(height=260)
-        st.altair_chart(chart, use_container_width=True)
-
-# Initial render
-render_frame(frame_idx)
-
-if play:
-    for i in range(frame_idx, total_frames):
-        render_frame(i)
-        time.sleep(speed_map[speed])
+if make_gif:
+    with st.spinner("Rendering timelapse…"):
+        path = render_gif(interp, center_lat=mid_lat, center_lon=mid_lon, outfile="bonus_week.gif",
+                          zoom=STATIC_ZOOM, w=STATIC_W, h=STATIC_H, step=3)
+    with open(path, "rb") as f:
+        st.download_button("⬇️ Download bonus_week.gif", data=f, file_name="bonus_week.gif", mime="image/gif")
 
 with st.expander("Raw data (first 500 rows)"):
     st.dataframe(df.head(500), use_container_width=True)
+
 
 
 
