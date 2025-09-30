@@ -1,12 +1,5 @@
 streamlit==1.38.0
 pandas==2.2.2
-numpy==1.26.4
 requests==2.32.3
-python-dotenv==1.0.1
-folium==0.17.0
-streamlit-folium==0.22.0
-plotly==5.23.0
-# Optional: if you want scikit-learn clustering for "most visited zone"
-scikit-learn==1.5.1
-# Optional: if you plan to install the Tractive client from GitHub
-# pip install git+https://github.com/FAXES/tractive.git
+pydeck==0.9.1
+
