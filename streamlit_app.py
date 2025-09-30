@@ -75,7 +75,6 @@ def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetim
         wdf["time"] = pd.to_datetime(wdf["time"], utc=True, errors="coerce")
         return wdf
     except requests.exceptions.RequestException:
-        # Graceful fallback: empty df = no weather overlay, rest of app still works
         return pd.DataFrame()
 
 def haversine_miles(lat1, lon1, lat2, lon2):
@@ -130,85 +129,136 @@ start_ts = df["timestamp"].min()
 end_ts = df["timestamp"].max()
 total_hours = max(1, int((end_ts - start_ts).total_seconds() // 3600))
 
-# Initialize session state keys once
-if "sel_hour" not in st.session_state:
-    st.session_state.sel_hour = 0
-if "playing" not in st.session_state:
-    st.session_state.playing = False
+# Playback speed selector
+speed = st.selectbox("Playback speed", ["Slow", "Normal", "Fast"], index=1)
+speed_map = {"Slow": 0.5, "Normal": 0.2, "Fast": 0.05}
 
-col1, col2, col3 = st.columns([4, 1, 1])
+col1, col2 = st.columns([4, 1])
 with col1:
-    sel_hour = st.slider("Playback hour", 0, total_hours, st.session_state.sel_hour, step=1)
+    sel_hour = st.slider("Playback hour", 0, total_hours, 0, step=1)
 with col2:
-    if st.button("▶️ Play"):
-        st.session_state.playing = True
-with col3:
-    if st.button("⏸ Pause"):
-        st.session_state.playing = False
+    play = st.button("▶️ Play")
 
-# Respect manual slider move
-st.session_state.sel_hour = sel_hour
+if play:
+    for h in range(sel_hour, total_hours + 1):
+        current_time = start_ts + pd.Timedelta(hours=h)
+        st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
 
-# Autoplay loop (advances 1 hour per tick)
-if st.session_state.playing and st.session_state.sel_hour < total_hours:
-    st.session_state.sel_hour += 1
-    time.sleep(0.2)  # <- adjust playback speed (sec per hour)
-    st.experimental_rerun()
+        # Current position of Bonus
+        cur = nearest_point_at(df, current_time)
 
-current_time = start_ts + pd.Timedelta(hours=st.session_state.sel_hour)
-st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
+        # Heatmap + icon
+        heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+        bonus_df = pd.DataFrame([{
+            "longitude": float(cur["lon"]),
+            "latitude": float(cur["lat"]),
+            "icon_data": {
+                "url": ICON_URL,
+                "width": 256,
+                "height": 256,
+                "anchorY": 256
+            }
+        }])
 
-# Current position of Bonus
-cur = nearest_point_at(df, current_time)
+        layers = [
+            pdk.Layer(
+                "HeatmapLayer",
+                data=heat_data,
+                get_position='[longitude, latitude]',
+                get_weight=1,
+                radius_pixels=40,
+                aggregation="MEAN",
+                color_range=[
+                    [0, 255, 0, 160],
+                    [255, 255, 0, 180],
+                    [255, 128, 0, 200],
+                    [255, 0, 0, 220],
+                ],
+            ),
+            pdk.Layer(
+                "IconLayer",
+                data=bonus_df,
+                get_icon="icon_data",
+                get_size=10,
+                size_scale=14,
+                get_position="[longitude, latitude]",
+            ),
+        ]
 
-# Heatmap data
-heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+        view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
+        deck = pdk.Deck(
+            map_style="mapbox://styles/mapbox/satellite-streets-v11",
+            layers=layers,
+            initial_view_state=view_state,
+            tooltip={"text": "Bonus’s weekly movement"}
+        )
+        st.pydeck_chart(deck)
 
-# Bonus icon at current time
-bonus_df = pd.DataFrame([{
-    "longitude": float(cur["lon"]),
-    "latitude": float(cur["lat"]),
-    "icon_data": {
-        "url": ICON_URL,
-        "width": 256,
-        "height": 256,
-        "anchorY": 256
-    }
-}])
+        # Weather overlay
+        if not wdf.empty:
+            idx = np.argmin(np.abs(wdf["time"].values - np.array(current_time, dtype="datetime64[ns]")))
+            cur_wx = wdf.iloc[idx]
+            st.write(
+                f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
+                f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
+                f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
+                f"• Precip: **{cur_wx['precipitation']:.2f} mm**"
+            )
 
-layers = [
-    pdk.Layer(
-        "HeatmapLayer",
-        data=heat_data,
-        get_position='[longitude, latitude]',
-        get_weight=1,
-        radius_pixels=40,
-        aggregation="MEAN",
-        color_range=[
-            [0, 255, 0, 160],   # green (least)
-            [255, 255, 0, 180], # yellow
-            [255, 128, 0, 200], # orange
-            [255, 0, 0, 220],   # red (most)
-        ],
-    ),
-    pdk.Layer(
-        "IconLayer",
-        data=bonus_df,
-        get_icon="icon_data",
-        get_size=10,       # bigger icon
-        size_scale=14,     # scale factor
-        get_position="[longitude, latitude]",
-    ),
-]
+        time.sleep(speed_map[speed])
 
-view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
-deck = pdk.Deck(
-    map_style="mapbox://styles/mapbox/satellite-streets-v11",
-    layers=layers,
-    initial_view_state=view_state,
-    tooltip={"text": "Bonus’s weekly movement"}
-)
-st.pydeck_chart(deck)
+# If not playing, still show the selected hour
+if not play:
+    current_time = start_ts + pd.Timedelta(hours=sel_hour)
+    st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
+
+    cur = nearest_point_at(df, current_time)
+
+    heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+    bonus_df = pd.DataFrame([{
+        "longitude": float(cur["lon"]),
+        "latitude": float(cur["lat"]),
+        "icon_data": {
+            "url": ICON_URL,
+            "width": 256,
+            "height": 256,
+            "anchorY": 256
+        }
+    }])
+
+    layers = [
+        pdk.Layer(
+            "HeatmapLayer",
+            data=heat_data,
+            get_position='[longitude, latitude]',
+            get_weight=1,
+            radius_pixels=40,
+            aggregation="MEAN",
+            color_range=[
+                [0, 255, 0, 160],
+                [255, 255, 0, 180],
+                [255, 128, 0, 200],
+                [255, 0, 0, 220],
+            ],
+        ),
+        pdk.Layer(
+            "IconLayer",
+            data=bonus_df,
+            get_icon="icon_data",
+            get_size=10,
+            size_scale=14,
+            get_position="[longitude, latitude]",
+        ),
+    ]
+
+    view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
+    deck = pdk.Deck(
+        map_style="mapbox://styles/mapbox/satellite-streets-v11",
+        layers=layers,
+        initial_view_state=view_state,
+        tooltip={"text": "Bonus’s weekly movement"}
+    )
+    st.pydeck_chart(deck)
 
 # Weather aligned panel
 st.subheader("Weather aligned to playback hour")
@@ -227,9 +277,10 @@ if not wdf.empty:
     )
 else:
     st.info("Weather service temporarily unavailable — map and playback still work.")
-    
+
 with st.expander("Raw data (first 500 rows)"):
     st.dataframe(df.head(500), use_container_width=True)
+
 
 
 
