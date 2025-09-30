@@ -5,11 +5,15 @@ import streamlit as st
 import pydeck as pdk
 from xml.etree import ElementTree as ET
 import numpy as np
+import time
 
 # ----------------- CONFIG -----------------
 GPX_FILE = "assets/Bonus_Latest.gpx"
 DASHBOARD_TITLE = "HerdTracker at Steep Mountain Farm — Bonus’s Weekly Recap"
 ICON_URL = "https://raw.githubusercontent.com/nyxbit-xvii/goatdash/refs/heads/main/assets/bonus_icon.png"
+
+# Set Mapbox key from secrets
+pdk.settings.mapbox_api_key = st.secrets["MAPBOX_API_KEY"]
 
 # ----------------- HELPERS -----------------
 def parse_gpx(path: str) -> pd.DataFrame:
@@ -92,14 +96,6 @@ def nearest_point_at(df: pd.DataFrame, t: pd.Timestamp) -> pd.Series:
 
 # ----------------- STREAMLIT -----------------
 st.set_page_config(page_title=DASHBOARD_TITLE, layout="wide")
-st.markdown(
-    """
-    <style>
-    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 st.title(DASHBOARD_TITLE)
 
 # Load weekly GPX
@@ -122,104 +118,100 @@ c2.metric("Time span", f"{hours_span} hours")
 # Weather (hourly)
 wdf = fetch_open_meteo(mid_lat, mid_lon, df["timestamp"].min().to_pydatetime(), df["timestamp"].max().to_pydatetime())
 
-# ---- Time scrubber (fast recap) ----
+# ---- Time controls ----
 st.subheader("Weekly Recap")
-colL, colR = st.columns([3, 2])
+start_ts = df["timestamp"].min()
+end_ts = df["timestamp"].max()
+total_hours = max(1, int((end_ts - start_ts).total_seconds() // 3600))
 
-with colL:
-    # Slider in hours from start
-    start_ts = df["timestamp"].min()
-    end_ts = df["timestamp"].max()
-    total_hours = max(1, int((end_ts - start_ts).total_seconds() // 3600))
-    sel_hour = st.slider("Playback hour (fast scrub)", 0, total_hours, 0, step=1)
-    current_time = start_ts + pd.Timedelta(hours=sel_hour)
-    st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
+col1, col2 = st.columns([3, 1])
+with col1:
+    sel_hour = st.slider("Playback hour", 0, total_hours, 0, step=1)
+with col2:
+    autoplay = st.checkbox("▶️ Play timelapse")
 
-    # Current position of Bonus at this hour
-    cur = nearest_point_at(df, current_time)
+# Autoplay loop
+if autoplay:
+    for h in range(sel_hour, total_hours + 1):
+        st.session_state["sel_hour"] = h
+        time.sleep(0.2)  # speed of playback (seconds per hour)
+        st.experimental_rerun()
 
-    # Heatmap data (all points)
-    heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+# Current time
+sel_hour = st.session_state.get("sel_hour", sel_hour)
+current_time = start_ts + pd.Timedelta(hours=sel_hour)
+st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
 
-    # Icon for Bonus at current time
-    bonus_df = pd.DataFrame([{
-        "longitude": float(cur["lon"]),
-        "latitude": float(cur["lat"]),
-        "icon_data": {
-            "url": ICON_URL,
-            "width": 256,
-            "height": 256,
-            "anchorY": 256
-        }
-    }])
+# Current position of Bonus
+cur = nearest_point_at(df, current_time)
 
-    layers = []
+# Heatmap
+heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+bonus_df = pd.DataFrame([{
+    "longitude": float(cur["lon"]),
+    "latitude": float(cur["lat"]),
+    "icon_data": {
+        "url": ICON_URL,
+        "width": 256,
+        "height": 256,
+        "anchorY": 256
+    }
+}])
 
-    # Heatmap (green -> yellow -> red)
-    layers.append(
-        pdk.Layer(
-            "HeatmapLayer",
-            data=heat_data,
-            get_position='[longitude, latitude]',
-            get_weight=1,
-            radius_pixels=40,
-            aggregation="MEAN",
-            color_range=[
-                [0, 255, 0, 160],    # green (least)
-                [255, 255, 0, 180],  # yellow
-                [255, 128, 0, 200],  # orange
-                [255, 0, 0, 220],    # red (most)
-            ],
-        )
+layers = []
+layers.append(
+    pdk.Layer(
+        "HeatmapLayer",
+        data=heat_data,
+        get_position='[longitude, latitude]',
+        get_weight=1,
+        radius_pixels=40,
+        aggregation="MEAN",
+        color_range=[
+            [0, 255, 0, 160],
+            [255, 255, 0, 180],
+            [255, 128, 0, 200],
+            [255, 0, 0, 220],
+        ],
     )
-
-    # Bonus icon (bigger)
-    layers.append(
-        pdk.Layer(
-            "IconLayer",
-            data=bonus_df,
-            get_icon="icon_data",
-            get_size=10,       # bigger icon
-            size_scale=14,     # scale factor
-            get_position="[longitude, latitude]",
-        )
+)
+layers.append(
+    pdk.Layer(
+        "IconLayer",
+        data=bonus_df,
+        get_icon="icon_data",
+        get_size=10,
+        size_scale=14,
+        get_position="[longitude, latitude]",
     )
+)
 
-    view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
+view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
+deck = pdk.Deck(
+    map_style="mapbox://styles/mapbox/satellite-streets-v11",
+    layers=layers,
+    initial_view_state=view_state,
+    tooltip={"text": "Bonus’s weekly movement"}
+)
+st.pydeck_chart(deck)
 
-    deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/satellite-streets-v11",
-        mapbox_key=st.secrets.get("MAPBOX_API_KEY", ""),
-        layers=layers,
-        initial_view_state=view_state,
-        tooltip={"text": "Bonus’s weekly movement"}
+# Weather aligned
+st.subheader("Weather aligned to playback hour")
+if not wdf.empty:
+    idx = np.argmin(np.abs(wdf["time"].values - np.array(current_time, dtype="datetime64[ns]")))
+    cur_wx = wdf.iloc[idx]
+    st.write(
+        f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
+        f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
+        f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
+        f"• Precip: **{cur_wx['precipitation']:.2f} mm**"
     )
-    st.pydeck_chart(deck)
-
-with colR:
-    st.markdown("**Weather aligned to playback hour**")
-    if not wdf.empty:
-        # Snap to the same hour in weather
-        # Find closest weather row to current_time (by hour)
-        wdf_sorted = wdf.sort_values("time")
-        idx = np.argmin(np.abs(wdf_sorted["time"].values - np.array(current_time, dtype="datetime64[ns]")))
-        cur_wx = wdf_sorted.iloc[idx]
-
-        st.write(
-            f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
-            f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
-            f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
-            f"• Precip: **{cur_wx['precipitation']:.2f} mm**"
-        )
-
-        # Show whole-week weather chart (line chart)
-        st.line_chart(
-            wdf.set_index("time")[["temperature_2m", "wind_speed_10m", "precipitation"]],
-            height=260
-        )
-        st.caption("Tip: drag the slider to scrub fast through the week and watch weather + position update.")
-    else:
-        st.info("No hourly weather returned for this time range.")
+    st.line_chart(
+        wdf.set_index("time")[["temperature_2m", "wind_speed_10m", "precipitation"]],
+        height=260
+    )
+else:
+    st.info("No hourly weather returned for this time range.")
 
 with st.expander("Raw data (first 500 rows)"):
     st.dataframe(df.head(500), use_container_width=True)
