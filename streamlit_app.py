@@ -8,6 +8,7 @@ import altair as alt
 from xml.etree import ElementTree as ET
 from io import BytesIO
 from PIL import Image, ImageDraw
+import imageio.v3 as iio
 
 # ----------------- CONFIG -----------------
 GPX_FILE = "assets/Bonus_Latest.gpx"
@@ -15,7 +16,7 @@ DASHBOARD_TITLE = "HerdTracker at Steep Mountain Farm — Bonus’s Weekly Recap
 ICON_URL = "https://raw.githubusercontent.com/nyxbit-xvii/goatdash/refs/heads/main/assets/bonus_icon.png"
 MAPBOX_STYLE = "mapbox://styles/mapbox/satellite-streets-v11"
 STATIC_IMAGE_STYLE = "satellite-streets-v11"
-STATIC_W, STATIC_H, STATIC_ZOOM = 1024, 768, 18
+STATIC_W, STATIC_H, STATIC_ZOOM = 800, 600, 18  # smaller for MP4 export
 
 # Mapbox token
 pdk.settings.mapbox_api_key = st.secrets["MAPBOX_API_KEY"]
@@ -89,7 +90,7 @@ def build_interpolated_track(df: pd.DataFrame, step_minutes: int = 1):
     interp.index.name = "timestamp"
     return interp.reset_index()
 
-# --- For GIF generation ---
+# --- For MP4 generation ---
 from math import pi, log, tan
 TILE_SIZE = 256
 
@@ -120,36 +121,29 @@ def fetch_icon():
     im = Image.open(BytesIO(resp.content)).convert("RGBA")
     return im
 
-def render_gif(interp: pd.DataFrame, center_lat, center_lon,
-               outfile="bonus_week.gif", zoom=STATIC_ZOOM,
-               w=STATIC_W, h=STATIC_H, step=3):
+def render_mp4(interp: pd.DataFrame, center_lat, center_lon,
+               outfile="bonus_week.mp4", zoom=STATIC_ZOOM,
+               w=STATIC_W, h=STATIC_H, step=10, fps=10):
+    """Render an MP4 timelapse instead of a GIF."""
     bg = fetch_static_map(center_lat, center_lon, w, h, zoom)
     icon = fetch_icon().resize((64,64), Image.LANCZOS)
     frames = []
-    trail_color = (0, 200, 255, 200)
-
     coords = [latlon_to_pixel(float(r.lat), float(r.lon), center_lat, center_lon, zoom, w, h)
               for r in interp.itertuples(index=False)]
 
     for i in range(0, len(interp), step):
         base = bg.copy()
         draw = ImageDraw.Draw(base, "RGBA")
-
         if i > 1:
-            draw.line(coords[max(0, i-300):i+1], fill=trail_color, width=4)
-
+            draw.line(coords[max(0, i-100):i+1], fill=(0,200,255,200), width=4)
         x, y = coords[i]
-        icon_pos = (x - icon.width//2, y - icon.height)
-        base.alpha_composite(icon, icon_pos)
-
+        base.alpha_composite(icon, (x - icon.width//2, y - icon.height))
         ts = interp.iloc[i]["timestamp"]
-        label = ts.strftime("%Y-%m-%d %H:%M UTC")
         draw.rectangle([(10, h-40), (320, h-10)], fill=(0,0,0,140))
-        draw.text((16, h-34), f"Bonus — {label}", fill=(255,255,255,230))
+        draw.text((16, h-34), f"Bonus — {ts.strftime('%Y-%m-%d %H:%M UTC')}", fill=(255,255,255,230))
+        frames.append(np.array(base))
 
-        frames.append(base)
-
-    frames[0].save(outfile, save_all=True, append_images=frames[1:], duration=90, loop=0, disposal=2)
+    iio.imwrite(outfile, frames, fps=fps)
     return outfile
 
 # ----------------- UI -----------------
@@ -230,14 +224,14 @@ if not wdf.empty:
     st.altair_chart(chart, use_container_width=True)
 st.markdown("---")
 
-# 3) GIF
-st.subheader("3) Weekly Timelapse (downloadable GIF)")
-make_gif = st.button("🎬 Generate GIF")
-if make_gif:
-    with st.spinner("Rendering timelapse…"):
-        path = render_gif(interp, mid_lat, mid_lon)
+# 3) MP4
+st.subheader("3) Weekly Timelapse (downloadable MP4)")
+make_mp4 = st.button("🎬 Generate MP4")
+if make_mp4:
+    with st.spinner("Rendering timelapse video…"):
+        path = render_mp4(interp, mid_lat, mid_lon, step=10, w=800, h=600, fps=10)
     with open(path, "rb") as f:
-        st.download_button("⬇️ Download bonus_week.gif", data=f, file_name="bonus_week.gif", mime="image/gif")
+        st.download_button("⬇️ Download bonus_week.mp4", data=f, file_name="bonus_week.mp4", mime="video/mp4")
 
 with st.expander("Raw data (first 500 rows)"):
     st.dataframe(df.head(500), use_container_width=True)
