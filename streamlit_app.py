@@ -66,7 +66,7 @@ def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetim
             "end_date": end.date().isoformat(),
             "timezone": "UTC",
         }
-        r = requests.get(url, params=params, timeout=45)  # longer timeout
+        r = requests.get(url, params=params, timeout=45)
         r.raise_for_status()
         data = r.json().get("hourly", {})
         if not data:
@@ -139,10 +139,15 @@ with col1:
 with col2:
     play = st.button("▶️ Play")
 
+# Placeholders for dynamic updates
+time_placeholder = st.empty()
+map_placeholder = st.empty()
+weather_placeholder = st.empty()
+
 if play:
     for h in range(sel_hour, total_hours + 1):
         current_time = start_ts + pd.Timedelta(hours=h)
-        st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
+        time_placeholder.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
 
         # Current position of Bonus
         cur = nearest_point_at(df, current_time)
@@ -192,13 +197,13 @@ if play:
             initial_view_state=view_state,
             tooltip={"text": "Bonus’s weekly movement"}
         )
-        st.pydeck_chart(deck)
+        map_placeholder.pydeck_chart(deck)
 
         # Weather overlay
         if not wdf.empty:
             idx = np.argmin(np.abs(wdf["time"].values - np.array(current_time, dtype="datetime64[ns]")))
             cur_wx = wdf.iloc[idx]
-            st.write(
+            weather_placeholder.write(
                 f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
                 f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
                 f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
@@ -207,10 +212,10 @@ if play:
 
         time.sleep(speed_map[speed])
 
-# If not playing, still show the selected hour
+# Manual mode if not playing
 if not play:
     current_time = start_ts + pd.Timedelta(hours=sel_hour)
-    st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
+    time_placeholder.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
 
     cur = nearest_point_at(df, current_time)
 
@@ -258,9 +263,9 @@ if not play:
         initial_view_state=view_state,
         tooltip={"text": "Bonus’s weekly movement"}
     )
-    st.pydeck_chart(deck)
+    map_placeholder.pydeck_chart(deck)
 
-# Weather aligned panel
+# Weather trends
 st.subheader("Weather aligned to playback hour")
 if not wdf.empty:
     idx = np.argmin(np.abs(wdf["time"].values - np.array(current_time, dtype="datetime64[ns]")))
@@ -280,6 +285,7 @@ else:
 
 with st.expander("Raw data (first 500 rows)"):
     st.dataframe(df.head(500), use_container_width=True)
+
 
 
 
