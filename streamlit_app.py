@@ -1,18 +1,18 @@
 import datetime as dt
+import time
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import pydeck as pdk
 from xml.etree import ElementTree as ET
-import numpy as np
-import time
 
 # ----------------- CONFIG -----------------
 GPX_FILE = "assets/Bonus_Latest.gpx"
 DASHBOARD_TITLE = "HerdTracker at Steep Mountain Farm — Bonus’s Weekly Recap"
 ICON_URL = "https://raw.githubusercontent.com/nyxbit-xvii/goatdash/refs/heads/main/assets/bonus_icon.png"
 
-# Set Mapbox key from secrets
+# Mapbox token from Streamlit secrets
 pdk.settings.mapbox_api_key = st.secrets["MAPBOX_API_KEY"]
 
 # ----------------- HELPERS -----------------
@@ -53,25 +53,30 @@ def parse_gpx(path: str) -> pd.DataFrame:
     df = df.dropna(subset=["timestamp", "lat", "lon"]).sort_values("timestamp").reset_index(drop=True)
     return df
 
+@st.cache_data(ttl=3600)
 def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-    """Fetch hourly weather from Open-Meteo API."""
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,wind_speed_10m,precipitation",
-        "start_date": start.date().isoformat(),
-        "end_date": end.date().isoformat(),
-        "timezone": "UTC",
-    }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json().get("hourly", {})
-    if not data:
+    """Fetch hourly weather from Open-Meteo API, cached to avoid refetching during autoplay."""
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "hourly": "temperature_2m,wind_speed_10m,precipitation",
+            "start_date": start.date().isoformat(),
+            "end_date": end.date().isoformat(),
+            "timezone": "UTC",
+        }
+        r = requests.get(url, params=params, timeout=45)  # longer timeout
+        r.raise_for_status()
+        data = r.json().get("hourly", {})
+        if not data:
+            return pd.DataFrame()
+        wdf = pd.DataFrame(data)
+        wdf["time"] = pd.to_datetime(wdf["time"], utc=True, errors="coerce")
+        return wdf
+    except requests.exceptions.RequestException:
+        # Graceful fallback: empty df = no weather overlay, rest of app still works
         return pd.DataFrame()
-    wdf = pd.DataFrame(data)
-    wdf["time"] = pd.to_datetime(wdf["time"], utc=True, errors="coerce")
-    return wdf
 
 def haversine_miles(lat1, lon1, lat2, lon2):
     """Great-circle distance in miles."""
@@ -94,7 +99,7 @@ def nearest_point_at(df: pd.DataFrame, t: pd.Timestamp) -> pd.Series:
     i = np.argmin(np.abs(df["timestamp"].values - np.array(t, dtype="datetime64[ns]")))
     return df.iloc[i]
 
-# ----------------- STREAMLIT -----------------
+# ----------------- STREAMLIT UI -----------------
 st.set_page_config(page_title=DASHBOARD_TITLE, layout="wide")
 st.title(DASHBOARD_TITLE)
 
@@ -115,38 +120,51 @@ c1, c2 = st.columns(2)
 c1.metric("Distance traveled", f"{dist_miles:.2f} miles")
 c2.metric("Time span", f"{hours_span} hours")
 
-# Weather (hourly)
+# Weather (cached)
 wdf = fetch_open_meteo(mid_lat, mid_lon, df["timestamp"].min().to_pydatetime(), df["timestamp"].max().to_pydatetime())
 
 # ---- Time controls ----
 st.subheader("Weekly Recap")
+
 start_ts = df["timestamp"].min()
 end_ts = df["timestamp"].max()
 total_hours = max(1, int((end_ts - start_ts).total_seconds() // 3600))
 
-col1, col2 = st.columns([3, 1])
+# Initialize session state keys once
+if "sel_hour" not in st.session_state:
+    st.session_state.sel_hour = 0
+if "playing" not in st.session_state:
+    st.session_state.playing = False
+
+col1, col2, col3 = st.columns([4, 1, 1])
 with col1:
-    sel_hour = st.slider("Playback hour", 0, total_hours, 0, step=1)
+    sel_hour = st.slider("Playback hour", 0, total_hours, st.session_state.sel_hour, step=1)
 with col2:
-    autoplay = st.checkbox("▶️ Play timelapse")
+    if st.button("▶️ Play"):
+        st.session_state.playing = True
+with col3:
+    if st.button("⏸ Pause"):
+        st.session_state.playing = False
 
-# Autoplay loop
-if autoplay:
-    for h in range(sel_hour, total_hours + 1):
-        st.session_state["sel_hour"] = h
-        time.sleep(0.2)  # speed of playback (seconds per hour)
-        st.experimental_rerun()
+# Respect manual slider move
+st.session_state.sel_hour = sel_hour
 
-# Current time
-sel_hour = st.session_state.get("sel_hour", sel_hour)
-current_time = start_ts + pd.Timedelta(hours=sel_hour)
+# Autoplay loop (advances 1 hour per tick)
+if st.session_state.playing and st.session_state.sel_hour < total_hours:
+    st.session_state.sel_hour += 1
+    time.sleep(0.2)  # <- adjust playback speed (sec per hour)
+    st.experimental_rerun()
+
+current_time = start_ts + pd.Timedelta(hours=st.session_state.sel_hour)
 st.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
 
 # Current position of Bonus
 cur = nearest_point_at(df, current_time)
 
-# Heatmap
+# Heatmap data
 heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+
+# Bonus icon at current time
 bonus_df = pd.DataFrame([{
     "longitude": float(cur["lon"]),
     "latitude": float(cur["lat"]),
@@ -158,8 +176,7 @@ bonus_df = pd.DataFrame([{
     }
 }])
 
-layers = []
-layers.append(
+layers = [
     pdk.Layer(
         "HeatmapLayer",
         data=heat_data,
@@ -168,23 +185,21 @@ layers.append(
         radius_pixels=40,
         aggregation="MEAN",
         color_range=[
-            [0, 255, 0, 160],
-            [255, 255, 0, 180],
-            [255, 128, 0, 200],
-            [255, 0, 0, 220],
+            [0, 255, 0, 160],   # green (least)
+            [255, 255, 0, 180], # yellow
+            [255, 128, 0, 200], # orange
+            [255, 0, 0, 220],   # red (most)
         ],
-    )
-)
-layers.append(
+    ),
     pdk.Layer(
         "IconLayer",
         data=bonus_df,
         get_icon="icon_data",
-        get_size=10,
-        size_scale=14,
+        get_size=10,       # bigger icon
+        size_scale=14,     # scale factor
         get_position="[longitude, latitude]",
-    )
-)
+    ),
+]
 
 view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
 deck = pdk.Deck(
@@ -195,7 +210,7 @@ deck = pdk.Deck(
 )
 st.pydeck_chart(deck)
 
-# Weather aligned
+# Weather aligned panel
 st.subheader("Weather aligned to playback hour")
 if not wdf.empty:
     idx = np.argmin(np.abs(wdf["time"].values - np.array(current_time, dtype="datetime64[ns]")))
@@ -211,9 +226,10 @@ if not wdf.empty:
         height=260
     )
 else:
-    st.info("No hourly weather returned for this time range.")
-
+    st.info("Weather service temporarily unavailable — map and playback still work.")
+    
 with st.expander("Raw data (first 500 rows)"):
     st.dataframe(df.head(500), use_container_width=True)
+
 
 
