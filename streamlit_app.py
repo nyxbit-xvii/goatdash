@@ -5,6 +5,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import pydeck as pdk
+import altair as alt
 from xml.etree import ElementTree as ET
 
 # ----------------- CONFIG -----------------
@@ -93,10 +94,17 @@ def total_distance_miles(df: pd.DataFrame) -> float:
         dist += haversine_miles(df.iloc[i-1].lat, df.iloc[i-1].lon, df.iloc[i].lat, df.iloc[i].lon)
     return float(dist)
 
-def nearest_point_at(df: pd.DataFrame, t: pd.Timestamp) -> pd.Series:
-    """Return the row closest in time to t (UTC)."""
-    i = np.argmin(np.abs(df["timestamp"].values - np.array(t, dtype="datetime64[ns]")))
-    return df.iloc[i]
+def build_interpolated_track(df: pd.DataFrame, step_minutes: int = 1):
+    """Resample timestamps to a regular grid and interpolate for smooth playback."""
+    s = df.set_index("timestamp")[["lat", "lon"]].sort_index()
+    start, end = s.index.min(), s.index.max()
+    new_index = pd.date_range(start, end, freq=f"{step_minutes}min", tz="UTC")
+    interp = s.reindex(new_index).interpolate(method="time").ffill().bfill()
+    interp.index.name = "timestamp"
+
+    seconds = (interp.index - interp.index[0]).total_seconds().astype(int)
+    coords = np.column_stack([interp["lon"].values, interp["lat"].values]).tolist()
+    return interp.reset_index(), seconds, coords
 
 # ----------------- STREAMLIT UI -----------------
 st.set_page_config(page_title=DASHBOARD_TITLE, layout="wide")
@@ -122,169 +130,124 @@ c2.metric("Time span", f"{hours_span} hours")
 # Weather (cached)
 wdf = fetch_open_meteo(mid_lat, mid_lon, df["timestamp"].min().to_pydatetime(), df["timestamp"].max().to_pydatetime())
 
+# Interpolate track to smooth frames (1-min steps)
+interp_df, frame_seconds, path_coords = build_interpolated_track(df, step_minutes=1)
+total_frames = len(interp_df)
+
+# Prebuild static Heatmap
+heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+heat_layer = pdk.Layer(
+    "HeatmapLayer",
+    data=heat_data,
+    get_position='[longitude, latitude]',
+    get_weight=1,
+    radius_pixels=40,
+    aggregation="MEAN",
+    color_range=[
+        [0, 255, 0, 160],
+        [255, 255, 0, 180],
+        [255, 128, 0, 200],
+        [255, 0, 0, 220],
+    ],
+)
+
+# Trips data
+trip_df = pd.DataFrame([{
+    "path": path_coords,
+    "timestamps": frame_seconds.tolist()
+}])
+
+# Zoomed-in view
+view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=18, pitch=45)
+
 # ---- Time controls ----
 st.subheader("Weekly Recap")
 
-start_ts = df["timestamp"].min()
-end_ts = df["timestamp"].max()
-total_hours = max(1, int((end_ts - start_ts).total_seconds() // 3600))
-
-# Playback speed selector
 speed = st.selectbox("Playback speed", ["Slow", "Normal", "Fast"], index=1)
-speed_map = {"Slow": 0.5, "Normal": 0.2, "Fast": 0.05}
+speed_map = {"Slow": 0.5, "Normal": 0.15, "Fast": 0.05}
 
-col1, col2 = st.columns([4, 1])
-with col1:
-    sel_hour = st.slider("Playback hour", 0, total_hours, 0, step=1)
-with col2:
-    play = st.button("▶️ Play")
+frame_idx = st.slider("Frame", 0, total_frames - 1, 0, step=1)
+play = st.button("▶️ Play")
 
-# Placeholders for dynamic updates
 time_placeholder = st.empty()
 map_placeholder = st.empty()
 weather_placeholder = st.empty()
 
-if play:
-    for h in range(sel_hour, total_hours + 1):
-        current_time = start_ts + pd.Timedelta(hours=h)
-        time_placeholder.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
+def render_frame(i: int):
+    """Render map + weather + chart marker for frame i."""
+    i = int(np.clip(i, 0, total_frames - 1))
+    ts = interp_df.iloc[i]["timestamp"]
+    lat = float(interp_df.iloc[i]["lat"])
+    lon = float(interp_df.iloc[i]["lon"])
+    time_placeholder.caption(f"Time: **{ts.strftime('%Y-%m-%d %H:%M UTC')}**")
 
-        # Current position of Bonus
-        cur = nearest_point_at(df, current_time)
+    # TripsLayer
+    trips_layer = pdk.Layer(
+        "TripsLayer",
+        data=trip_df,
+        get_path="path",
+        get_timestamps="timestamps",
+        get_color=[0, 200, 255],
+        width_min_pixels=4,
+        trail_length=600,
+        current_time=int(frame_seconds[i]),
+    )
 
-        # Heatmap + icon
-        heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
-        bonus_df = pd.DataFrame([{
-            "longitude": float(cur["lon"]),
-            "latitude": float(cur["lat"]),
-            "icon_data": {
-                "url": ICON_URL,
-                "width": 256,
-                "height": 256,
-                "anchorY": 256
-            }
-        }])
-
-        layers = [
-            pdk.Layer(
-                "HeatmapLayer",
-                data=heat_data,
-                get_position='[longitude, latitude]',
-                get_weight=1,
-                radius_pixels=40,
-                aggregation="MEAN",
-                color_range=[
-                    [0, 255, 0, 160],
-                    [255, 255, 0, 180],
-                    [255, 128, 0, 200],
-                    [255, 0, 0, 220],
-                ],
-            ),
-            pdk.Layer(
-                "IconLayer",
-                data=bonus_df,
-                get_icon="icon_data",
-                get_size=10,
-                size_scale=14,
-                get_position="[longitude, latitude]",
-            ),
-        ]
-
-        view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
-        deck = pdk.Deck(
-            map_style="mapbox://styles/mapbox/satellite-streets-v11",
-            layers=layers,
-            initial_view_state=view_state,
-            tooltip={"text": "Bonus’s weekly movement"}
-        )
-        map_placeholder.pydeck_chart(deck)
-
-        # Weather overlay
-        if not wdf.empty:
-            idx = np.argmin(np.abs(wdf["time"].values - np.array(current_time, dtype="datetime64[ns]")))
-            cur_wx = wdf.iloc[idx]
-            weather_placeholder.write(
-                f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
-                f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
-                f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
-                f"• Precip: **{cur_wx['precipitation']:.2f} mm**"
-            )
-
-        time.sleep(speed_map[speed])
-
-# Manual mode if not playing
-if not play:
-    current_time = start_ts + pd.Timedelta(hours=sel_hour)
-    time_placeholder.caption(f"Time: **{current_time.strftime('%Y-%m-%d %H:%M UTC')}**")
-
-    cur = nearest_point_at(df, current_time)
-
-    heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+    # Icon at head
     bonus_df = pd.DataFrame([{
-        "longitude": float(cur["lon"]),
-        "latitude": float(cur["lat"]),
-        "icon_data": {
-            "url": ICON_URL,
-            "width": 256,
-            "height": 256,
-            "anchorY": 256
-        }
+        "longitude": lon,
+        "latitude": lat,
+        "icon_data": {"url": ICON_URL, "width": 256, "height": 256, "anchorY": 256}
     }])
+    icon_layer = pdk.Layer(
+        "IconLayer",
+        data=bonus_df,
+        get_icon="icon_data",
+        get_size=10,
+        size_scale=14,
+        get_position="[longitude, latitude]",
+    )
 
-    layers = [
-        pdk.Layer(
-            "HeatmapLayer",
-            data=heat_data,
-            get_position='[longitude, latitude]',
-            get_weight=1,
-            radius_pixels=40,
-            aggregation="MEAN",
-            color_range=[
-                [0, 255, 0, 160],
-                [255, 255, 0, 180],
-                [255, 128, 0, 200],
-                [255, 0, 0, 220],
-            ],
-        ),
-        pdk.Layer(
-            "IconLayer",
-            data=bonus_df,
-            get_icon="icon_data",
-            get_size=10,
-            size_scale=14,
-            get_position="[longitude, latitude]",
-        ),
-    ]
-
-    view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=15, pitch=45)
     deck = pdk.Deck(
         map_style="mapbox://styles/mapbox/satellite-streets-v11",
-        layers=layers,
+        layers=[heat_layer, trips_layer, icon_layer],
         initial_view_state=view_state,
         tooltip={"text": "Bonus’s weekly movement"}
     )
     map_placeholder.pydeck_chart(deck)
 
-# Weather trends
-st.subheader("Weather aligned to playback hour")
-if not wdf.empty:
-    idx = np.argmin(np.abs(wdf["time"].values - np.array(current_time, dtype="datetime64[ns]")))
-    cur_wx = wdf.iloc[idx]
-    st.write(
-        f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
-        f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
-        f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
-        f"• Precip: **{cur_wx['precipitation']:.2f} mm**"
-    )
-    st.line_chart(
-        wdf.set_index("time")[["temperature_2m", "wind_speed_10m", "precipitation"]],
-        height=260
-    )
-else:
-    st.info("Weather service temporarily unavailable — map and playback still work.")
+    # Weather panel
+    if not wdf.empty:
+        idx = np.argmin(np.abs(wdf["time"].values - np.array(ts, dtype="datetime64[ns]")))
+        cur_wx = wdf.iloc[idx]
+        weather_placeholder.write(
+            f"**{cur_wx['time'].strftime('%Y-%m-%d %H:%M UTC')}**  "
+            f"• Temp: **{cur_wx['temperature_2m']:.1f}°C**  "
+            f"• Wind: **{cur_wx['wind_speed_10m']:.1f} m/s**  "
+            f"• Precip: **{cur_wx['precipitation']:.2f} mm**"
+        )
+
+        # Weather trends with vertical marker
+        base = alt.Chart(wdf).encode(x="time:T")
+        line_temp = base.mark_line(color="red").encode(y="temperature_2m:Q")
+        line_wind = base.mark_line(color="blue").encode(y="wind_speed_10m:Q")
+        line_precip = base.mark_line(color="green").encode(y="precipitation:Q")
+        rule = alt.Chart(pd.DataFrame({"time": [ts]})).mark_rule(color="white", strokeDash=[4,4]).encode(x="time:T")
+
+        chart = alt.layer(line_temp, line_wind, line_precip, rule).resolve_scale(y="independent").properties(height=260)
+        st.altair_chart(chart, use_container_width=True)
+
+# Initial render
+render_frame(frame_idx)
+
+if play:
+    for i in range(frame_idx, total_frames):
+        render_frame(i)
+        time.sleep(speed_map[speed])
 
 with st.expander("Raw data (first 500 rows)"):
     st.dataframe(df.head(500), use_container_width=True)
+
 
 
 
