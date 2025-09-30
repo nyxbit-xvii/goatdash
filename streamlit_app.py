@@ -29,70 +29,54 @@ def parse_csv(file) -> pd.DataFrame:
 
 def parse_gpx(file) -> pd.DataFrame:
     """
-    Robust GPX parser (works with Tractive exports).
-    Returns a DataFrame with columns: timestamp, lat, lon (and optional speed if present in <cmt>).
+    Parse Tractive GPX export into DataFrame with timestamp, lat, lon, (optional) speed.
     """
-    import re
     from xml.etree import ElementTree as ET
 
-    # Read bytes from Streamlit's UploadedFile, then decode
+    # Read file contents
     data = file.getvalue() if hasattr(file, "getvalue") else file.read()
     if isinstance(data, bytes):
         text = data.decode("utf-8", errors="ignore")
     else:
         text = str(data)
 
-    try:
-        root = ET.fromstring(text)
-    except Exception as e:
-        raise ValueError(f"GPX parse error: {e}")
+    root = ET.fromstring(text)
 
-    # Detect default namespace from root.tag, e.g., "{http://www.topografix.com/GPX/1/1}gpx"
-    m = re.match(r"\{(.*)\}", root.tag)
-    ns = m.group(1) if m else "http://www.topografix.com/GPX/1/1"
+    # GPX namespace
+    ns = {"g": "http://www.topografix.com/GPX/1/1"}
 
-    sel_trkpt = f".//{{{ns}}}trkpt"
-    sel_wpt   = f".//{{{ns}}}wpt"
-    sel_time  = f".//{{{ns}}}time"
-    sel_ele   = f".//{{{ns}}}ele"
-    sel_cmt   = f".//{{{ns}}}cmt"
-
-    # Prefer track points; fall back to waypoints if needed
-    pts = root.findall(sel_trkpt)
-    if not pts:
-        pts = root.findall(sel_wpt)
-
+    # Find all track points
+    pts = root.findall(".//g:trkpt", ns)
     rows = []
     for p in pts:
         lat = p.attrib.get("lat")
         lon = p.attrib.get("lon")
-        t_el = p.find(sel_time) or p.find("time")      # fallback if no namespace
-        c_el = p.find(sel_cmt)  or p.find("cmt")
+        time_el = p.find("g:time", ns)
+        cmt_el = p.find("g:cmt", ns)
 
-        t = t_el.text if t_el is not None else None
-        c = c_el.text if c_el is not None else None
-
-        rows.append({"timestamp": t, "lat": lat, "lon": lon, "cmt": c})
+        rows.append({
+            "timestamp": time_el.text if time_el is not None else None,
+            "lat": lat,
+            "lon": lon,
+            "cmt": cmt_el.text if cmt_el is not None else None
+        })
 
     df = pd.DataFrame(rows)
     if df.empty:
-        raise ValueError("No points found in GPX file.")
+        raise ValueError("No <trkpt> points found in GPX.")
 
-    # Convert types
+    # Convert datatypes
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
 
-    # Optional speed extraction if Tractive stored "speed: X" in <cmt>
+    # Extract speed from comment if available
     if "cmt" in df.columns:
         sp = df["cmt"].str.extract(r"speed:\s*([\d\.]+)")
-        with pd.option_context("mode.chained_assignment", None):
-            df["speed"] = pd.to_numeric(sp[0], errors="coerce")
+        df["speed"] = pd.to_numeric(sp[0], errors="coerce")
 
-    # Keep only valid rows
-    df = df.dropna(subset=["timestamp", "lat", "lon"]).sort_values("timestamp").reset_index(drop=True)
-    if df.empty:
-        raise ValueError("No valid points with time/lat/lon found in GPX file.")
+    # Drop invalid rows
+    df = df.dropna(subset=["timestamp","lat","lon"]).sort_values("timestamp").reset_index(drop=True)
 
     return df
 
