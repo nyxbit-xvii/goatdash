@@ -28,25 +28,55 @@ def parse_csv(file) -> pd.DataFrame:
     return out.dropna(subset=["timestamp","lat","lon"]).sort_values("timestamp")
 
 def parse_gpx(file) -> pd.DataFrame:
+    """
+    Parse GPX file (like those exported from Tractive) into a DataFrame
+    with columns: timestamp, lat, lon.
+    """
     from xml.etree import ElementTree as ET
+
+    # Read text
     text = file.read()
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="ignore")
-    root = ET.fromstring(text)
-    ns = {"g":"http://www.topografix.com/GPX/1/1"}
+
+    # Parse XML
+    try:
+        root = ET.fromstring(text)
+    except Exception as e:
+        raise ValueError(f"GPX parse error: {e}")
+
+    # Common GPX namespace
+    ns = {"g": "http://www.topografix.com/GPX/1/1"}
+
+    # Look for <trkpt> (track points) or <wpt> (waypoints)
     pts = root.findall(".//g:trkpt", ns) or root.findall(".//trkpt")
+    if not pts:
+        pts = root.findall(".//g:wpt", ns) or root.findall(".//wpt")
+
     rows = []
     for p in pts:
         lat = p.attrib.get("lat")
         lon = p.attrib.get("lon")
+
+        # Try to find a <time> element inside the point
         time_el = p.find("g:time", ns) or p.find("time")
-        if lat and lon and time_el is not None and time_el.text:
+        t = time_el.text if time_el is not None else None
+
+        if lat and lon:
             rows.append({
-                "timestamp": pd.to_datetime(time_el.text, utc=True, errors="coerce"),
+                "timestamp": pd.to_datetime(t, utc=True, errors="coerce") if t else pd.NaT,
                 "lat": pd.to_numeric(lat, errors="coerce"),
                 "lon": pd.to_numeric(lon, errors="coerce")
             })
-    return pd.DataFrame(rows).dropna(subset=["timestamp","lat","lon"]).sort_values("timestamp")
+
+    df = pd.DataFrame(rows).dropna(subset=["lat", "lon"])
+    if "timestamp" in df:
+        df = df.dropna(subset=["timestamp"])
+    if df.empty:
+        raise ValueError("No valid points with time/lat/lon found in GPX file.")
+
+    return df.sort_values("timestamp").reset_index(drop=True)
+
 
 def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
     url = "https://api.open-meteo.com/v1/forecast"
