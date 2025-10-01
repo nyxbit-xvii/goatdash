@@ -265,23 +265,23 @@ if not wdf.empty:
     st.altair_chart(chart, use_container_width=True)
 st.markdown("---")
 
-# 3) Weekly Timelapse (downloadable MP4)
-st.subheader("3) Weekly Timelapse (downloadable MP4)")
-make_mp4 = st.button("🎬 Generate MP4")
-if make_mp4:
-    try:
-        with st.spinner("Rendering timelapse video…"):
-            path = render_mp4_safe(interp, mid_lat, mid_lon, step=12, w=STATIC_W, h=STATIC_H, fps=10)
-        with open(path, "rb") as f:
-            data = f.read()
-            st.video(data)  # preview
-            st.download_button("⬇️ Download bonus_week.mp4", data=data,
-                               file_name="bonus_week.mp4", mime="video/mp4")
-    except Exception as e:
-        st.error(f"Video rendering failed: {e}")
+# 3) Weekly Timelapse (pre-generated MP4)
+st.subheader("3) Weekly Timelapse — Bonus’s Weekly Recap")
 
-with st.expander("Raw data (first 500 rows)"):
-    st.dataframe(df.head(500), use_container_width=True)
+VIDEO_PATH = "assets/bonus_week.mp4"
+
+if os.path.exists(VIDEO_PATH):
+    st.video(VIDEO_PATH)
+    with open(VIDEO_PATH, "rb") as f:
+        st.download_button(
+            "⬇️ Download bonus_week.mp4",
+            f,
+            file_name="bonus_week.mp4",
+            mime="video/mp4"
+        )
+else:
+    st.warning("No video found yet. Please upload or generate bonus_week.mp4.")
+
 
 
 
