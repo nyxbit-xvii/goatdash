@@ -1,3 +1,4 @@
+import os
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -265,9 +266,10 @@ if not wdf.empty:
     st.altair_chart(chart, use_container_width=True)
 st.markdown("---")
 
-# 3) Weekly Timelapse (pre-generated MP4)
+# 3) Weekly Timelapse — pre-generated MP4
 st.subheader("3) Weekly Timelapse — Bonus’s Weekly Recap")
 
+# Prefer local/repo file; optionally fall back to a hosted URL if you want
 VIDEO_PATH = "assets/bonus_week.mp4"
 
 if os.path.exists(VIDEO_PATH):
@@ -280,7 +282,9 @@ if os.path.exists(VIDEO_PATH):
             mime="video/mp4"
         )
 else:
-    st.warning("No video found yet. Please upload or generate bonus_week.mp4.")
+    st.warning("No video found at assets/bonus_week.mp4. "
+               "Generate locally with make_timelapse.py and commit it to the repo.")
+
 
 
 
