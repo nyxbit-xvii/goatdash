@@ -84,23 +84,25 @@ def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetim
     except requests.exceptions.RequestException:
         return pd.DataFrame()
 
-def haversine_miles(lat1, lon1, lat2, lon2):
-    from math import radians, sin, cos, asin, sqrt
+def haversine_miles_vec(lat1, lon1, lat2, lon2):
     R = 3958.8
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    lat1 = np.radians(lat1.astype(float))
+    lon1 = np.radians(lon1.astype(float))
+    lat2 = np.radians(lat2.astype(float))
+    lon2 = np.radians(lon2.astype(float))
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
-    return R * 2 * asin(sqrt(a))
+    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    return R * 2 * np.arcsin(np.sqrt(a))
 
 def total_distance_miles(df: pd.DataFrame) -> float:
     if len(df) < 2:
         return 0.0
-    shifted = df.shift(1)
-    dist = haversine_miles(df["lat"], df["lon"], shifted["lat"], shifted["lon"])
-    if isinstance(dist, pd.Series):
-        return float(dist.iloc[1:].sum())
-    return float(dist)
+    lat = df["lat"].to_numpy()
+    lon = df["lon"].to_numpy()
+    dists = haversine_miles_vec(lat[:-1], lon[:-1], lat[1:], lon[1:])
+    return float(np.nansum(dists))
+
 
 def build_interpolated_track(df: pd.DataFrame, step_minutes: int = 1):
     s = df.set_index("timestamp")[["lat", "lon"]].sort_index()
