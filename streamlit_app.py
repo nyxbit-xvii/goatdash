@@ -29,9 +29,8 @@ STATIC_IMAGE_STYLE = "satellite-streets-v11"
 STATIC_W, STATIC_H, STATIC_ZOOM = 800, 600, 18
 
 # Home/run polygons (KMZ or GeoJSON)
-KMZ_PATH = "assets/herd_home.kmz"       # contains "Ungulate Home" and "Ungulate Run"
+KMZ_PATH = "assets/herd_home.kmz"          # contains "Ungulate Home" & "Ungulate Run"
 GEOJSON_PATH = "assets/herd_home.geojson"  # optional fallback if present
-
 HOME_NAMES = ["Ungulate Home", "Ungulate Run"]
 
 # ===================== MAPBOX TOKEN =====================
@@ -40,7 +39,7 @@ try:
     mapbox_token = st.secrets["MAPBOX_API_KEY"]
     pdk.settings.mapbox_api_key = mapbox_token
 except Exception:
-    pdk.settings.mapbox_api_key = None  # allow app to run; maps blank without key
+    pdk.settings.mapbox_api_key = None  # allow app to run; maps will be blank without key
 
 # ===================== HELPERS =====================
 def parse_gpx_text(text: str) -> pd.DataFrame:
@@ -213,12 +212,12 @@ def render_mp4_safe(interp: pd.DataFrame,
     raise RuntimeError(f"FFmpeg failed (tried libx264 & mpeg4). Last error: {last_err}")
 
 # ---------- KMZ / GeoJSON polygon utilities ----------
+# Shapely optional (we also provide a pure-Python fallback)
 try:
     from shapely.geometry import shape, Point
     _HAS_SHAPELY = True
 except Exception:
     _HAS_SHAPELY = False
-    from matplotlib.path import Path
 
 def _kmz_to_geojson_features(kmz_path: str) -> List[dict]:
     """Extract Polygon features from the first KML inside a KMZ."""
@@ -272,24 +271,72 @@ def _polys_from_features(features: List[dict]) -> List[List[Tuple[float, float]]
                 polys.append([(float(lon), float(lat)) for lon, lat in ring])
     return polys
 
+# ---- Pure-Python point-in-polygon (ray casting) ----
+def _point_in_polygon(x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
+    """
+    Ray-casting point-in-polygon.
+    poly: list of (lon, lat) vertices, closed or open.
+    Returns True if inside or on boundary.
+    """
+    n = len(poly)
+    if n < 3:
+        return False
+
+    inside = False
+    x0, y0 = poly[-1]
+    for x1, y1 in poly:
+        # Boundary checks (with epsilon)
+        eps = 1e-12
+        if min(x0, x1) - eps <= x <= max(x0, x1) + eps and min(y0, y1) - eps <= y <= max(y0, y1) + eps:
+            dx = x1 - x0
+            dy = y1 - y0
+            if abs(dx) < eps and abs(x - x0) < eps:
+                if min(y0, y1) - eps <= y <= max(y0, y1) + eps:
+                    return True
+            elif abs(dy) < eps and abs(y - y0) < eps:
+                if min(x0, x1) - eps <= x <= max(x0, x1) + eps:
+                    return True
+            else:
+                t = ((x - x0) * dy - (y - y0) * dx)
+                if abs(t) < eps:
+                    return True
+
+        # Ray casting toggler
+        cond = ((y0 > y) != (y1 > y))
+        if cond:
+            x_intersect = x0 + (x1 - x0) * (y - y0) / (y1 - y0)
+            if x_intersect >= x:
+                inside = not inside
+        x0, y0 = x1, y1
+
+    return inside
+
 def _points_in_any_polygon(lons: np.ndarray, lats: np.ndarray, polygons: List[List[Tuple[float, float]]]) -> np.ndarray:
+    """
+    Vector over points; returns mask True if a point is inside ANY polygon.
+    Uses shapely if available, otherwise pure-Python ray casting.
+    """
     if len(polygons) == 0:
         return np.zeros(lons.shape, dtype=bool)
+
+    mask = np.zeros(lons.shape, dtype=bool)
+
     if _HAS_SHAPELY:
         shapely_polys = [shape({"type": "Polygon", "coordinates": [poly]}) for poly in polygons]
-        mask = np.zeros(lons.shape, dtype=bool)
         for i in range(lons.size):
             p = Point(float(lons[i]), float(lats[i]))
             if any(poly.covers(p) for poly in shapely_polys):
                 mask[i] = True
         return mask
-    else:
-        mask = np.zeros(lons.shape, dtype=bool)
-        pts = np.c_[lons, lats]
+
+    # Pure-Python fallback
+    for i in range(lons.size):
+        x, y = float(lons[i]), float(lats[i])
         for poly in polygons:
-            path = Path(poly, closed=True)
-            mask |= path.contains_points(pts, radius=0.0)
-        return mask
+            if _point_in_polygon(x, y, poly):
+                mask[i] = True
+                break
+    return mask
 
 # ===================== UI =====================
 st.set_page_config(page_title=DASHBOARD_TITLE, layout="wide")
@@ -306,7 +353,11 @@ map_zoom = st.sidebar.slider("Map zoom", 12, 20, 18, 1)
 trail_len_points = st.sidebar.slider("Breadcrumb trail length (points)", 20, 1000, 250, 10)
 
 st.sidebar.markdown("---")
-suppress_home = st.sidebar.toggle("Suppress home area on heatmap", value=True, help="Down-weight points inside Ungulate Home & Ungulate Run")
+suppress_home = st.sidebar.toggle(
+    "Suppress home area on heatmap",
+    value=True,
+    help="Down-weight points inside Ungulate Home & Ungulate Run"
+)
 home_damp = st.sidebar.slider("Home dampening factor", 0.0, 1.0, 0.25, 0.05)
 
 # GPX source
@@ -431,10 +482,8 @@ if suppress_home:
     else:
         home_mask = _points_in_any_polygon(lons, lats, home_polys)
         weights_heat[:] = 1.0
-        # Down-weight inside home/run
         weights_heat[home_mask] = float(home_damp)
 
-# Keep heatmap data minimal and serializable
 df["weight_heat"] = weights_heat
 
 # ===================== 1) Weekly Heatmap =====================
@@ -465,7 +514,7 @@ heat_layer = pdk.Layer(
 
 heat_view = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=map_zoom, pitch=map_pitch)
 st.pydeck_chart(pdk.Deck(map_style=MAPBOX_STYLE, layers=[heat_layer], initial_view_state=heat_view))
-st.caption("Toggle and tune suppression in the sidebar. Only affects the heatmap.")
+st.caption("Toggle + tune suppression in the sidebar. Only affects the heatmap.")
 st.markdown("---")
 
 # ===================== 2) Inspect a Time + Weather =====================
@@ -580,6 +629,7 @@ with colv2:
 # ===================== Footer =====================
 st.markdown("---")
 st.caption("Built with ❤️ at Steep Mountain Farm • Bonus the Explorer • Goatdash")
+
 
 
 
