@@ -319,24 +319,38 @@ st.markdown("---")
 
 # ----------------- 1) Weekly Heatmap -----------------
 st.subheader("1) Weekly Heatmap")
-heat_data = df.rename(columns={"lat": "latitude", "lon": "longitude"})
+
+# ✅ Build a minimal, numeric-only dataframe for pydeck
+heat_data = (
+    df[["lat", "lon"]]
+      .rename(columns={"lat": "latitude", "lon": "longitude"})
+      .assign(weight=1.0)
+      .dropna()
+      .astype({"latitude": "float64", "longitude": "float64", "weight": "float64"})
+)
+
+# (Optional) convert to list of dicts if you want to be extra safe:
+# heat_data = heat_data.to_dict(orient="records")
+
 heat_layer = pdk.Layer(
     "HeatmapLayer",
     data=heat_data,
     get_position='[longitude, latitude]',
-    get_weight=1,
+    get_weight='weight',
     radius_pixels=int(heat_radius),
     aggregation="MEAN",
     color_range=[
         [0, 255, 0, 160],
         [255, 255, 0, 180],
         [255, 128, 0, 200],
-        [255, 0, 0, 220]
+        [255, 0, 0, 220],
     ],
 )
+
 heat_view = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=map_zoom, pitch=map_pitch)
 st.pydeck_chart(pdk.Deck(map_style=MAPBOX_STYLE, layers=[heat_layer], initial_view_state=heat_view))
 st.markdown("---")
+
 
 # ----------------- 2) Inspect a Time (icon jumps) + Weather -----------------
 st.subheader("2) Inspect a Time — Bonus moves to the selected hour")
