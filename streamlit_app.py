@@ -1,7 +1,12 @@
 # streamlit_app.py
-
 import os
+import re
+import json
+import zipfile
 import datetime as dt
+from math import pi, log, tan
+from typing import List, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
@@ -12,29 +17,32 @@ from xml.etree import ElementTree as ET
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import imageio.v3 as iio
-from math import pi, log, tan
 
-# ----------------- CONFIG -----------------
-DEFAULT_GPX_FILE = "assets/Bonus_Latest.gpx"
+# ===================== CONFIG =====================
 DASHBOARD_TITLE = "HerdTracker at Steep Mountain Farm — Bonus’s Weekly Recap"
+DEFAULT_GPX_FILE = "assets/Bonus_Latest.gpx"
 ICON_URL = "https://raw.githubusercontent.com/nyxbit-xvii/goatdash/refs/heads/main/assets/bonus_icon.png"
 
-# Mapbox / styles
+# Map styles / static map settings
 MAPBOX_STYLE = "mapbox://styles/mapbox/satellite-streets-v11"
 STATIC_IMAGE_STYLE = "satellite-streets-v11"
-STATIC_W, STATIC_H, STATIC_ZOOM = 800, 600, 18  # for static frames
+STATIC_W, STATIC_H, STATIC_ZOOM = 800, 600, 18
 
-# ----------------- MAPBOX TOKEN -----------------
+# Home/run polygons (KMZ or GeoJSON)
+KMZ_PATH = "assets/herd_home.kmz"       # contains "Ungulate Home" and "Ungulate Run"
+GEOJSON_PATH = "assets/herd_home.geojson"  # optional fallback if present
+
+HOME_NAMES = ["Ungulate Home", "Ungulate Run"]
+
+# ===================== MAPBOX TOKEN =====================
 mapbox_token = None
 try:
     mapbox_token = st.secrets["MAPBOX_API_KEY"]
     pdk.settings.mapbox_api_key = mapbox_token
 except Exception:
-    # Allow app to start with a warning; pydeck will show a blank map without a token
-    st.sidebar.warning("⚠️ MAPBOX_API_KEY not found in secrets. Add it to .streamlit/secrets.toml for maps.")
-    pdk.settings.mapbox_api_key = None
+    pdk.settings.mapbox_api_key = None  # allow app to run; maps blank without key
 
-# ----------------- HELPERS -----------------
+# ===================== HELPERS =====================
 def parse_gpx_text(text: str) -> pd.DataFrame:
     ns = {"g": "http://www.topografix.com/GPX/1/1"}
     root = ET.fromstring(text)
@@ -84,25 +92,28 @@ def fetch_open_meteo(lat: float, lon: float, start: dt.datetime, end: dt.datetim
     except requests.exceptions.RequestException:
         return pd.DataFrame()
 
-def haversine_miles_vec(lat1, lon1, lat2, lon2):
+def haversine_miles(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, asin, sqrt
     R = 3958.8
-    lat1 = np.radians(lat1.astype(float))
-    lon1 = np.radians(lon1.astype(float))
-    lat2 = np.radians(lat2.astype(float))
-    lon2 = np.radians(lon2.astype(float))
+    lat1, lon1, lat2, lon2 = map(float, [lat1, lon1, lat2, lon2])
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
-    return R * 2 * np.arcsin(np.sqrt(a))
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return R * 2 * asin(sqrt(a))
 
 def total_distance_miles(df: pd.DataFrame) -> float:
-    if len(df) < 2:
+    if df is None or len(df) < 2:
         return 0.0
-    lat = df["lat"].to_numpy()
-    lon = df["lon"].to_numpy()
-    dists = haversine_miles_vec(lat[:-1], lon[:-1], lat[1:], lon[1:])
-    return float(np.nansum(dists))
-
+    dist = 0.0
+    for i in range(1, len(df)):
+        dist += haversine_miles(
+            df.iloc[i-1].lat,
+            df.iloc[i-1].lon,
+            df.iloc[i].lat,
+            df.iloc[i].lon
+        )
+    return float(dist)
 
 def build_interpolated_track(df: pd.DataFrame, step_minutes: int = 1):
     s = df.set_index("timestamp")[["lat", "lon"]].sort_index()
@@ -112,7 +123,7 @@ def build_interpolated_track(df: pd.DataFrame, step_minutes: int = 1):
     interp.index.name = "timestamp"
     return interp.reset_index()
 
-# --- Web mercator helpers for static map to pixels ---
+# ---- Web mercator helpers (for timelapse frames) ----
 TILE_SIZE = 256
 def _lon_to_x(lon, z): return (lon + 180.0) / 360.0 * (2**z) * TILE_SIZE
 def _lat_to_y(lat, z):
@@ -158,7 +169,6 @@ def render_mp4_safe(interp: pd.DataFrame,
                     h: int = None,
                     step: int = 12,
                     fps: int = 10) -> str:
-    """Stream frames to FFmpeg. No huge lists in RAM."""
     if zoom is None: zoom = STATIC_ZOOM
     if w is None: w = STATIC_W
     if h is None: h = STATIC_H
@@ -175,8 +185,8 @@ def render_mp4_safe(interp: pd.DataFrame,
         dict(codec="libx264", pix_fmt="yuv420p"),
         dict(codec="mpeg4",  pix_fmt="yuv420p"),
     ]
-    last_err = None
     os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    last_err = None
     for enc in codecs:
         try:
             with iio.imopen(outfile, "w", plugin="FFMPEG", fps=fps, **enc) as writer:
@@ -184,7 +194,7 @@ def render_mp4_safe(interp: pd.DataFrame,
                     frame = bg.copy()
                     draw = ImageDraw.Draw(frame, "RGBA")
                     if i > 1:
-                        start_idx = max(0, i - 80)  # short trail
+                        start_idx = max(0, i - 80)
                         draw.line(coords[start_idx:i+1], fill=(0, 200, 255, 200), width=4)
                     x, y = coords[i]
                     frame.alpha_composite(icon, (x - icon.width//2, y - icon.height))
@@ -202,18 +212,105 @@ def render_mp4_safe(interp: pd.DataFrame,
             continue
     raise RuntimeError(f"FFmpeg failed (tried libx264 & mpeg4). Last error: {last_err}")
 
-# ----------------- UI -----------------
+# ---------- KMZ / GeoJSON polygon utilities ----------
+try:
+    from shapely.geometry import shape, Point
+    _HAS_SHAPELY = True
+except Exception:
+    _HAS_SHAPELY = False
+    from matplotlib.path import Path
+
+def _kmz_to_geojson_features(kmz_path: str) -> List[dict]:
+    """Extract Polygon features from the first KML inside a KMZ."""
+    if not os.path.exists(kmz_path):
+        return []
+    with zipfile.ZipFile(kmz_path, "r") as z:
+        kml_name = next((n for n in z.namelist() if n.lower().endswith(".kml")), None)
+        if not kml_name:
+            return []
+        data = z.read(kml_name)
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
+    root = ET.fromstring(data)
+    feats = []
+    for pm in root.findall(".//kml:Placemark", ns):
+        name_el = pm.find("kml:name", ns)
+        name = (name_el.text or "").strip() if name_el is not None else "Unnamed"
+        for poly in pm.findall(".//kml:Polygon", ns):
+            outer = poly.find(".//kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns)
+            if outer is None or not outer.text:
+                continue
+            coords = []
+            for trip in re.split(r"\s+", outer.text.strip()):
+                if not trip:
+                    continue
+                parts = trip.split(",")
+                if len(parts) >= 2:
+                    lon, lat = float(parts[0]), float(parts[1])
+                    coords.append([lon, lat])
+            if len(coords) >= 3:
+                feats.append({
+                    "type": "Feature",
+                    "properties": {"name": name},
+                    "geometry": {"type": "Polygon", "coordinates": [coords]},
+                })
+    return feats
+
+def _features_by_name(features: List[dict], names: List[str]) -> List[dict]:
+    wanted = {n.lower() for n in names}
+    return [f for f in features if f.get("properties", {}).get("name", "").lower() in wanted]
+
+def _polys_from_features(features: List[dict]) -> List[List[Tuple[float, float]]]:
+    polys = []
+    for f in features:
+        geom = f.get("geometry", {})
+        if geom.get("type") == "Polygon":
+            ring = geom.get("coordinates", [[]])[0]
+            polys.append([(float(lon), float(lat)) for lon, lat in ring])
+        elif geom.get("type") == "MultiPolygon":
+            for poly in geom.get("coordinates", []):
+                ring = poly[0]
+                polys.append([(float(lon), float(lat)) for lon, lat in ring])
+    return polys
+
+def _points_in_any_polygon(lons: np.ndarray, lats: np.ndarray, polygons: List[List[Tuple[float, float]]]) -> np.ndarray:
+    if len(polygons) == 0:
+        return np.zeros(lons.shape, dtype=bool)
+    if _HAS_SHAPELY:
+        shapely_polys = [shape({"type": "Polygon", "coordinates": [poly]}) for poly in polygons]
+        mask = np.zeros(lons.shape, dtype=bool)
+        for i in range(lons.size):
+            p = Point(float(lons[i]), float(lats[i]))
+            if any(poly.covers(p) for poly in shapely_polys):
+                mask[i] = True
+        return mask
+    else:
+        mask = np.zeros(lons.shape, dtype=bool)
+        pts = np.c_[lons, lats]
+        for poly in polygons:
+            path = Path(poly, closed=True)
+            mask |= path.contains_points(pts, radius=0.0)
+        return mask
+
+# ===================== UI =====================
 st.set_page_config(page_title=DASHBOARD_TITLE, layout="wide")
 st.title(DASHBOARD_TITLE)
 
-# -------- Sidebar Controls --------
+# Sidebar
 st.sidebar.header("Controls")
+if not mapbox_token:
+    st.sidebar.warning("⚠️ Add MAPBOX_API_KEY to .streamlit/secrets.toml for maps.")
+
 heat_radius = st.sidebar.slider("Heatmap radius (px)", 10, 120, 40, 5)
 map_pitch = st.sidebar.slider("Map pitch (°)", 0, 60, 45, 5)
 map_zoom = st.sidebar.slider("Map zoom", 12, 20, 18, 1)
 trail_len_points = st.sidebar.slider("Breadcrumb trail length (points)", 20, 1000, 250, 10)
 
-# GPX load choice
+st.sidebar.markdown("---")
+suppress_home = st.sidebar.toggle("Suppress home area on heatmap", value=True, help="Down-weight points inside Ungulate Home & Ungulate Run")
+home_damp = st.sidebar.slider("Home dampening factor", 0.0, 1.0, 0.25, 0.05)
+
+# GPX source
+st.sidebar.markdown("---")
 gpx_source = st.sidebar.radio("GPX source", ["Repo file", "Upload"], horizontal=True)
 gpx_bytes = None
 if gpx_source == "Upload":
@@ -221,7 +318,7 @@ if gpx_source == "Upload":
     if up is not None:
         gpx_bytes = up.read()
 
-# -------- Data Ingest --------
+# Data ingest
 try:
     if gpx_bytes:
         df = parse_gpx_text(gpx_bytes.decode("utf-8"))
@@ -253,21 +350,18 @@ c3.metric("Points", f"{len(df):,}")
 wdf = fetch_open_meteo(mid_lat, mid_lon, df["timestamp"].min().to_pydatetime(), df["timestamp"].max().to_pydatetime())
 interp = build_interpolated_track(df, step_minutes=1)
 
-# ----------------- 0) Daily Summary Panel -----------------
+# ===================== 0) Daily Summary Panel =====================
 st.subheader("0) Daily Summary Panel")
 
 def _bin_zone(lat, lon, precision=3):
-    # ~precision=3 => ~100–150 m bins (roughly; depends on latitude)
     return (round(lat, precision), round(lon, precision))
 
-if "date" not in df.columns:
-    df["date"] = df["timestamp"].dt.date
+df["date"] = df["timestamp"].dt.date
 
-# Distance per day
-def _daily_distance(d):
-    if len(d) < 2:
+def _daily_distance(g):
+    if len(g) < 2:
         return 0.0
-    return total_distance_miles(d[["timestamp","lat","lon"]].reset_index(drop=True))
+    return total_distance_miles(g[["timestamp","lat","lon"]].reset_index(drop=True))
 
 daily = (
     df.groupby("date", as_index=False)
@@ -279,11 +373,8 @@ daily = (
       }))
       .reset_index(drop=True)
 )
-
-# Active hours ~ hours spanned with data
 daily["active_hours"] = (daily["end"] - daily["start"]).dt.total_seconds() / 3600
 
-# Most-visited zone per day
 df["zone"] = df.apply(lambda r: _bin_zone(r["lat"], r["lon"], precision=3), axis=1)
 mv = (
     df.groupby(["date","zone"])
@@ -295,9 +386,7 @@ mv = (
 )
 daily = daily.merge(mv, on="date", how="left")
 
-# Show table + compact cards
 with st.expander("Daily details", expanded=True):
-    # Chart distance per day
     dist_chart = alt.Chart(daily).mark_bar().encode(
         x=alt.X("date:T", title="Date"),
         y=alt.Y("distance_miles:Q", title="Distance (mi)"),
@@ -305,7 +394,6 @@ with st.expander("Daily details", expanded=True):
     ).properties(height=140)
     st.altair_chart(dist_chart, use_container_width=True)
 
-    # Small list
     for _, r in daily.iterrows():
         z = r["most_visited_zone"]
         ztxt = f"{z[0]:.3f}, {z[1]:.3f}" if isinstance(z, tuple) else "—"
@@ -317,20 +405,48 @@ with st.expander("Daily details", expanded=True):
 
 st.markdown("---")
 
-# ----------------- 1) Weekly Heatmap -----------------
+# ===================== HEATMAP WEIGHTING =====================
+# Build heatmap-specific weights (optionally suppress home/run)
+lats = df["lat"].to_numpy(dtype=float)
+lons = df["lon"].to_numpy(dtype=float)
+
+weights_heat = np.ones(lons.shape, dtype=float)
+
+if suppress_home:
+    # Load polygons: try KMZ first, fall back to GeoJSON if present
+    features = _kmz_to_geojson_features(KMZ_PATH) if os.path.exists(KMZ_PATH) else []
+    if not features and os.path.exists(GEOJSON_PATH):
+        try:
+            with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
+                gj = json.load(f)
+            features = gj.get("features", [])
+        except Exception as e:
+            st.warning(f"GeoJSON load failed: {e}")
+
+    home_feats = _features_by_name(features, HOME_NAMES)
+    home_polys = _polys_from_features(home_feats)
+
+    if not home_polys:
+        st.info("Home/run polygons not found in KMZ/GeoJSON; heatmap uses uniform weights.")
+    else:
+        home_mask = _points_in_any_polygon(lons, lats, home_polys)
+        weights_heat[:] = 1.0
+        # Down-weight inside home/run
+        weights_heat[home_mask] = float(home_damp)
+
+# Keep heatmap data minimal and serializable
+df["weight_heat"] = weights_heat
+
+# ===================== 1) Weekly Heatmap =====================
 st.subheader("1) Weekly Heatmap")
 
-# ✅ Build a minimal, numeric-only dataframe for pydeck
 heat_data = (
-    df[["lat", "lon"]]
-      .rename(columns={"lat": "latitude", "lon": "longitude"})
-      .assign(weight=1.0)
+    df[["lat", "lon", "weight_heat"]]
+      .rename(columns={"lat": "latitude", "lon": "longitude", "weight_heat": "weight"})
       .dropna()
       .astype({"latitude": "float64", "longitude": "float64", "weight": "float64"})
+    # .to_dict(orient="records")  # uncomment if pydeck has serialization issues
 )
-
-# (Optional) convert to list of dicts if you want to be extra safe:
-# heat_data = heat_data.to_dict(orient="records")
 
 heat_layer = pdk.Layer(
     "HeatmapLayer",
@@ -349,10 +465,10 @@ heat_layer = pdk.Layer(
 
 heat_view = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=map_zoom, pitch=map_pitch)
 st.pydeck_chart(pdk.Deck(map_style=MAPBOX_STYLE, layers=[heat_layer], initial_view_state=heat_view))
+st.caption("Toggle and tune suppression in the sidebar. Only affects the heatmap.")
 st.markdown("---")
 
-
-# ----------------- 2) Inspect a Time (icon jumps) + Weather -----------------
+# ===================== 2) Inspect a Time + Weather =====================
 st.subheader("2) Inspect a Time — Bonus moves to the selected hour")
 start_ts = df["timestamp"].min().floor("h")
 end_ts   = df["timestamp"].max().ceil("h")
@@ -370,7 +486,7 @@ sel_time = st.slider(
 sel_time = pd.Timestamp(sel_time)
 sel_time = sel_time.tz_localize("UTC") if sel_time.tzinfo is None else sel_time.tz_convert("UTC")
 
-# tz-safe nearest
+# nearest in interpolated track
 i_idx = (interp["timestamp"] - sel_time).abs().idxmin()
 cur_lat, cur_lon = float(interp.loc[i_idx, "lat"]), float(interp.loc[i_idx, "lon"])
 
@@ -399,19 +515,16 @@ if not wdf.empty:
     chart = alt.layer(line_temp, line_wind, line_precip, rule).resolve_scale(y="independent").properties(height=260)
     st.altair_chart(chart, use_container_width=True)
 else:
-    st.info("No weather data available for this time window.")
+    st.info("No weather data available for this window.")
 st.markdown("---")
 
-# ----------------- 3) Breadcrumb Pathline Map -----------------
+# ===================== 3) Breadcrumb Pathline =====================
 st.subheader("3) Breadcrumb Pathline (sequential movement)")
 
-# Build a short trail ending at sel_time
 trail_df = interp.copy()
 trail_df["delta"] = (trail_df["timestamp"] - sel_time).abs()
 trail_df = trail_df.sort_values("delta").head(trail_len_points).sort_values("timestamp")
-path_data = [{
-    "path": trail_df[["lon","lat"]].to_numpy().tolist()
-}]
+path_data = [{"path": trail_df[["lon","lat"]].to_numpy().tolist()}]
 
 path_layer = pdk.Layer(
     "PathLayer",
@@ -422,7 +535,6 @@ path_layer = pdk.Layer(
     get_color=[0, 200, 255, 200],
 )
 
-# Current icon on the same map
 icon_layer2 = pdk.Layer(
     "IconLayer",
     data=pd.DataFrame([{
@@ -437,12 +549,11 @@ icon_layer2 = pdk.Layer(
 
 view = pdk.ViewState(latitude=cur_lat, longitude=cur_lon, zoom=map_zoom, pitch=map_pitch)
 st.pydeck_chart(pdk.Deck(map_style=MAPBOX_STYLE, layers=[path_layer, icon_layer2], initial_view_state=view))
-st.caption("Trail length is controlled in the sidebar. This draws a time-ordered breadcrumb ending at the selected time above.")
+st.caption("Trail ends at the selected time above. Adjust length in the sidebar.")
 st.markdown("---")
 
-# ----------------- 4) Weekly Timelapse — pre-generated MP4 -----------------
+# ===================== 4) Weekly Timelapse =====================
 st.subheader("4) Weekly Timelapse — Bonus’s Weekly Recap")
-
 VIDEO_PATH = "assets/bonus_week.mp4"
 colv1, colv2 = st.columns([3,2], vertical_alignment="center")
 
@@ -450,14 +561,14 @@ with colv1:
     if os.path.exists(VIDEO_PATH):
         st.video(VIDEO_PATH)
     else:
-        st.warning("No video found at assets/bonus_week.mp4. Generate below or pre-commit it to the repo.")
+        st.warning("No video found at assets/bonus_week.mp4. Generate below or add to repo.")
 
 with colv2:
     if os.path.exists(VIDEO_PATH):
         with open(VIDEO_PATH, "rb") as f:
             st.download_button("⬇️ Download bonus_week.mp4", f, file_name="bonus_week.mp4", mime="video/mp4")
     with st.expander("Generate/refresh timelapse (experimental)"):
-        st.caption("Renders a short MP4 with a moving icon over a static satellite image. Requires Mapbox token and FFmpeg libs.")
+        st.caption("Renders an MP4 with a moving icon over a static satellite image. Needs Mapbox token + FFmpeg libs.")
         if st.button("Render MP4 now"):
             try:
                 out = render_mp4_safe(interp, mid_lat, mid_lon, outfile=VIDEO_PATH, step=12, fps=10)
@@ -466,9 +577,10 @@ with colv2:
             except Exception as e:
                 st.error(f"Render failed: {e}")
 
-# ----------------- Footer -----------------
+# ===================== Footer =====================
 st.markdown("---")
 st.caption("Built with ❤️ at Steep Mountain Farm • Bonus the Explorer • Goatdash")
+
 
 
 
